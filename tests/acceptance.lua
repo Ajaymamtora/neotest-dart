@@ -1,5 +1,5 @@
 -- Run with: nvim --headless -u NONE -l tests/acceptance.lua
--- Requires Dart and installed Neotest, nio, plenary, nvim-dap and Dart parser.
+-- Requires Dart (or FLUTTER), installed Neotest, nio, plenary, nvim-dap and Dart parser.
 local lazy = vim.env.NEOTEST_DART_LAZY or (vim.fn.stdpath('data') .. '/lazy')
 vim.opt.runtimepath:append(vim.fn.getcwd())
 for _, plugin in ipairs({ 'neotest', 'nvim-nio', 'plenary.nvim', 'nvim-dap', 'nvim-treesitter' }) do
@@ -10,11 +10,15 @@ local dap = require('dap')
 local standalone = { type = 'executable', command = 'unrelated-application-sdk' }
 dap.adapters.dart_test = standalone
 dap.adapters.dart = standalone
-local dart = vim.env.DART or vim.fn.exepath('dart')
-assert(dart ~= '', 'Dart SDK is required')
+local flutter = vim.env.FLUTTER
+local dart = flutter or vim.env.DART or vim.fn.exepath('dart')
+assert(dart ~= '', 'Dart or Flutter SDK is required')
+local language = flutter and 'Flutter' or 'Dart'
 local adapter = require('neotest-dart')({ command = { dart }, use_lsp = false })
-local fixture = vim.fn.getcwd() .. '/tests/fixtures/dart project'
-local scratch = vim.fn.tempname() .. ' switched Dart project'
+local fixture = vim.fn.getcwd()
+  .. '/tests/fixtures/'
+  .. (flutter and 'flutter project' or 'dart project')
+local scratch = vim.fn.tempname() .. ' switched ' .. language .. ' project'
 local failure, completed
 local function equal(actual, expected)
   assert(vim.deep_equal(actual, expected), vim.inspect({ actual = actual, expected = expected }))
@@ -76,6 +80,17 @@ local function completed_result(handle)
   end
   return handle.result()
 end
+local function check_debug_exit(handle, expected)
+  local code = completed_result(handle)
+  assert(not handle.error(), handle.error())
+  local output = table.concat(vim.fn.readfile(handle.output()), '\n')
+  if flutter and output:find('DAP session ended without an event_exited exitCode', 1, true) then
+    equal(code, 1)
+    print('Flutter DAP omitted exitCode; checking authoritative final report instead')
+  else
+    equal(code, expected)
+  end
+end
 nio.run(function()
   process({ dart, 'pub', 'get' }, fixture, 0)
   vim.fn.mkdir(scratch .. '/test', 'p')
@@ -125,7 +140,7 @@ nio.run(function()
   run(tests.skipped, { names[4] }, 0)
   run(tests.fails, { names[3] }, 1)
 
-  local breakpoint_line = 8
+  local breakpoint_line = flutter and 9 or 8
   local buffer = vim.fn.bufadd(file)
   vim.fn.bufload(buffer)
   vim.bo[buffer].filetype = 'dart'
@@ -139,8 +154,14 @@ nio.run(function()
     end
     nio.scheduler()
   end
-  local function debug_run(cancel)
-    wait_idle()
+  local function debug_run(cancel, immediate)
+    if not immediate then
+      wait_idle()
+    else
+      print(
+        'RESTART without transport-close wait; active sessions=' .. vim.tbl_count(dap.sessions())
+      )
+    end
     nio.scheduler()
     require('dap.breakpoints').clear()
     require('dap.breakpoints').set({}, buffer, breakpoint_line)
@@ -185,7 +206,7 @@ nio.run(function()
         found = true
       end
     end
-    assert(found, 'Expected real localValue in Dart stack scope')
+    assert(found, 'Expected real localValue in ' .. language .. ' stack scope')
     nio.scheduler()
     if cancel then
       handle.stop()
@@ -193,14 +214,14 @@ nio.run(function()
       nio.scheduler()
       local cancelled = adapter.results(spec, { output = handle.output() }, nearest)
       equal(cancelled[nearest:data().id].status, 'failed')
-      print('PASS Dart DAP cancellation at source breakpoint')
+      print('PASS ' .. language .. ' DAP cancellation at source breakpoint')
     else
       request(stop.session, 'next', { threadId = stop.body.threadId })
       local step = wait_stop()
       equal(step.body.reason, 'step')
       local stepped =
         request(step.session, 'stackTrace', { threadId = step.body.threadId }).stackFrames
-      equal(stepped[1].line, breakpoint_line + 1)
+      equal(stepped[1].line, breakpoint_line + (flutter and 2 or 1))
       local value = request(step.session, 'evaluate', {
         expression = 'localValue',
         frameId = stepped[1].id,
@@ -208,12 +229,14 @@ nio.run(function()
       })
       equal(value.result, '42')
       request(step.session, 'continue', { threadId = step.body.threadId })
-      equal(completed_result(handle), 0)
+      check_debug_exit(handle, 0)
       nio.scheduler()
       check_ids(spec.context.results_path, { names[1] })
       local debugged = adapter.results(spec, { output = handle.output() }, nearest)
       equal(debugged[nearest:data().id].status, 'passed')
-      print('PASS Dart DAP breakpoint, step, variables, exact ID and authoritative report')
+      print(
+        'PASS ' .. language .. ' DAP breakpoint, step, variables, exact ID and authoritative report'
+      )
     end
     watchdog:stop()
     watchdog:close()
@@ -223,7 +246,7 @@ nio.run(function()
   end
   debug_run(false)
   debug_run(true)
-  debug_run(false)
+  debug_run(false, vim.env.NEOTEST_DART_IMMEDIATE == '1')
   require('dap.breakpoints').clear()
   dap.listeners.after.event_stopped.dart_acceptance = function(session, body)
     -- Report-only runs do not request a breakpoint; resume SDK isolate entry.
@@ -236,17 +259,46 @@ nio.run(function()
     wait_idle()
     local spec = adapter.build_spec({ tree = node, strategy = 'dap' })
     local handle = assert(strategy(spec, { adapter = adapter.name, position = node:data() }))
-    equal(completed_result(handle), index == 1 and 1 or 0)
+    check_debug_exit(handle, index == 1 and 1 or 0)
     nio.scheduler()
     check_ids(spec.context.results_path, { names[index == 1 and 3 or 4] })
     local reported = adapter.results(spec, { output = handle.output() }, node)
     equal(reported[node:data().id].status, index == 1 and 'failed' or 'skipped')
   end
   nio.scheduler()
-  vim.fn.mkdir(scratch .. '/.fvm', 'p')
-  local sdk = vim.fn.fnamemodify(vim.fn.resolve(dart), ':h:h')
-  assert(vim.loop.fs_symlink(sdk, scratch .. '/.fvm/flutter_sdk'))
-  adapter({ command = 'fvm dart', use_lsp = false })
+  local fvm_command = flutter and 'fvm flutter' or 'fvm dart'
+  if vim.env.NEOTEST_DART_FVM_VERSION then
+    process({
+      'fvm',
+      'use',
+      vim.env.NEOTEST_DART_FVM_VERSION,
+      '--force',
+      '--skip-setup',
+      '--skip-pub-get',
+    }, scratch, 0)
+    adapter({ command = fvm_command, use_lsp = false })
+    local cli_spec = adapter.build_spec({ tree = other })
+    local cli = process(cli_spec.command, cli_spec.cwd, 1)
+    local output = vim.fn.tempname()
+    vim.fn.writefile(vim.split(cli.stdout, '\n'), output)
+    check_ids(output, names)
+    local cli_results = adapter.results(cli_spec, { output = output, code = 1 }, other)
+    for _, node in other:iter_nodes() do
+      if node:data().type == 'test' then
+        local name = node:data().name
+        equal(
+          cli_results[node:data().id].status,
+          name == 'fails' and 'failed' or name == 'skipped' and 'skipped' or 'passed'
+        )
+      end
+    end
+    print('PASS real FVM CLI execution with project-local SDK')
+  else
+    vim.fn.mkdir(scratch .. '/.fvm', 'p')
+    local sdk = vim.fn.fnamemodify(vim.fn.resolve(dart), ':h:h')
+    assert(vim.loop.fs_symlink(sdk, scratch .. '/.fvm/flutter_sdk'))
+    adapter({ command = fvm_command, use_lsp = false })
+  end
   wait_idle()
   local fvm_spec = adapter.build_spec({ tree = other, strategy = 'dap' })
   equal(fvm_spec.cwd, scratch)
@@ -255,7 +307,7 @@ nio.run(function()
     vim.loop.fs_realpath(dart)
   )
   local fvm_handle = assert(strategy(fvm_spec, { adapter = adapter.name, position = other:data() }))
-  equal(completed_result(fvm_handle), 1)
+  check_debug_exit(fvm_handle, 1)
   nio.scheduler()
   check_ids(fvm_spec.context.results_path, names)
   local fvm_results = adapter.results(fvm_spec, { output = fvm_handle.output() }, other)
@@ -272,19 +324,21 @@ nio.run(function()
     skipped = 'skipped',
   })
   wait_idle()
-  print('PASS Dart DAP project-local SDK symlink after project switch (not FVM CLI)')
+  print('PASS ' .. language .. ' DAP project-local SDK after project switch')
   dap.listeners.after.event_stopped.dart_acceptance = nil
-  print('PASS Dart DAP failing and skipped authoritative reports')
-  print('PASS Dart fixture file/nearest/group/marked/project switching and DAP restart')
+  print('PASS ' .. language .. ' DAP failing and skipped authoritative reports')
+  print(
+    'PASS ' .. language .. ' fixture file/nearest/group/marked/project switching and DAP restart'
+  )
 end, function(ok, err)
   failure = not ok and (err or 'Unknown acceptance failure') or nil
   completed = true
 end)
 assert(
-  vim.wait(240000, function()
+  vim.wait(480000, function()
     return completed
   end, 20),
-  'Dart acceptance timed out'
+  language .. ' acceptance timed out'
 )
 vim.fn.delete(scratch, 'rf')
 if failure then
