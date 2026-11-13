@@ -1,0 +1,5 @@
+name: neotest_dart_scoped_fixture
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+dev_dependencies:
+  test: ^1.25.0
