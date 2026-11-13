@@ -22,11 +22,14 @@ local function construct_neotest_status(test_result)
 end
 
 local function normalize_uri(uri)
-  if not uri then
+  if type(uri) ~= 'string' then
     return nil
   end
-
-  return uri:gsub('^file://', '')
+  if vim.startswith(uri, 'file:') then
+    local ok, path = pcall(vim.uri_to_fname, uri)
+    return ok and path or nil
+  end
+  return uri
 end
 
 local function runtime_position_key(test)
@@ -57,22 +60,51 @@ local function append_message(target, message)
   target.message = target.message .. '\n' .. message
 end
 
+local function valid_fields(value, fields)
+  for key, expected in pairs(fields) do
+    if value[key] ~= nil and type(value[key]) ~= expected then
+      return false
+    end
+  end
+  return true
+end
+
 ---@param lines string[]
----@return table, table, table
+---@return table, table, table, table
 local function marshal_test_results(lines)
   local tests_by_id = {}
   local tests_by_name = {}
   local runtimes_by_position = {}
   local unparsable_lines = {}
+  local report = { complete = false, invalid = false, tests = tests_by_id }
 
   for _, line in ipairs(lines) do
     if line ~= '' then
       local ok, json = pcall(vim.json.decode, line, { luanil = { object = true } })
-      if not ok then
+      if not ok or type(json) ~= 'table' then
         table.insert(unparsable_lines, line)
-      elseif json.test then
+        report.invalid = true
+      elseif json.type == 'done' then
+        report.invalid = report.invalid or report.complete
+        report.complete = type(json.success) == 'boolean'
+        report.success = json.success
+        report.invalid = report.invalid or not report.complete
+      elseif type(json.test) == 'table' then
         local id = json.test.id
-        if id then
+        if
+          type(id) ~= 'number'
+          or type(json.test.name) ~= 'string'
+          or not valid_fields(json.test, {
+            url = 'string',
+            root_url = 'string',
+            line = 'number',
+            root_line = 'number',
+            column = 'number',
+            root_column = 'number',
+          })
+        then
+          report.invalid = true
+        else
           local test_data = tests_by_id[id] or {}
           test_data.name = json.test.name
           test_data.position_key = runtime_position_key(json.test)
@@ -90,9 +122,23 @@ local function marshal_test_results(lines)
         end
       elseif json.testID then
         local test_data = tests_by_id[json.testID]
-        if test_data then
+        if
+          not test_data
+          or not valid_fields(json, {
+            result = 'string',
+            message = 'string',
+            error = 'string',
+            stackTrace = 'string',
+            skipped = 'boolean',
+            hidden = 'boolean',
+            time = 'number',
+          })
+        then
+          report.invalid = true
+        else
           if json.result then
             test_data.status = dart_to_neotest_status_map[json.result]
+            report.invalid = report.invalid or test_data.status == nil
           end
           append_message(test_data, json.message)
           if json.error then
@@ -109,11 +155,18 @@ local function marshal_test_results(lines)
             test_data.hidden = json.hidden
           end
         end
+      elseif
+        json.test ~= nil
+        or json.type == 'testStart'
+        or json.type == 'testDone'
+        or type(json.type) ~= 'string'
+      then
+        report.invalid = true
       end
     end
   end
 
-  return runtimes_by_position, tests_by_name, unparsable_lines
+  return runtimes_by_position, tests_by_name, unparsable_lines, report
 end
 
 local function highlight_as_error(message)
@@ -250,8 +303,11 @@ local function merge_test_results(test_results)
         merged.status = 'skipped'
       end
 
-      merged.skipped = merged.skipped == nil and test_result.skipped
-        or (merged.skipped and test_result.skipped)
+      if merged.skipped == nil then
+        merged.skipped = test_result.skipped == true
+      else
+        merged.skipped = merged.skipped and test_result.skipped == true
+      end
       merged.time = (merged.time or 0) + (test_result.time or 0)
 
       append_message(merged, test_result.message)
@@ -278,8 +334,26 @@ local function merge_test_results(test_results)
   return merged
 end
 
+M.failed_result = function(tree, message, output)
+  local failure = {
+    status = 'failed',
+    short = message,
+    output = output,
+    errors = { { message = message } },
+  }
+  local results = { [tree:data().id] = vim.deepcopy(failure) }
+  for _, node in tree:iter_nodes() do
+    local value = node:data()
+    if value.type == 'test' then
+      results[value.id] = vim.deepcopy(failure)
+    end
+  end
+  return results
+end
+
 M.parse_lines = function(tree, lines, outline, opts)
-  local runtimes_by_position, tests_by_name, unparsable_lines = marshal_test_results(lines)
+  opts = opts or {}
+  local runtimes_by_position, tests_by_name, unparsable_lines, report = marshal_test_results(lines)
   local results = {}
 
   for _, node in tree:iter_nodes() do
@@ -299,6 +373,41 @@ M.parse_lines = function(tree, lines, outline, opts)
           errors = construct_diagnostic_errors(test_result),
         }
         results[value.id] = neotest_result
+      end
+    end
+  end
+  if opts.final then
+    local incomplete = false
+    for _, test_result in pairs(report.tests) do
+      incomplete = incomplete or test_result.status == nil
+    end
+    if
+      report.invalid
+      or not report.complete
+      or incomplete
+      or report.success == false
+      or next(results) == nil
+    then
+      local message = 'Dart test report is missing, malformed, incomplete, or reports a failed run'
+      local failure = M.failed_result(
+        tree,
+        message,
+        prepare_neotest_output({ error = message }, unparsable_lines, opts)
+      )
+      local infrastructure_failure = report.invalid or not report.complete or incomplete
+      for id, result in pairs(failure) do
+        if
+          (not results[id] and infrastructure_failure)
+          or (results[id] and results[id].status == 'running')
+        then
+          results[id] = result
+        end
+      end
+      -- Keep concrete test failures (and their diagnostics) when the selected
+      -- position is itself a test.
+      local id = tree:data().id
+      if not results[id] or results[id].status ~= 'failed' then
+        results[id] = failure[id]
       end
     end
   end

@@ -1,2 +1,6 @@
 
 Session.vim
+
+tests/fixtures/**/.dart_tool/
+tests/fixtures/**/pubspec.lock
+tests/fixtures/**/build/
