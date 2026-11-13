@@ -443,123 +443,7 @@ test('adapter respects use_lsp and avoids duplicate wrapping', function()
   end
 end)
 
-test('adapter uses positional path when running individual tests', function()
-  reset_modules({
-    'neotest.async',
-    'plenary.path',
-    'neotest.lib',
-    'neotest-dart.utils',
-    'neotest-dart.parser',
-    'neotest-dart.lsp_outline_parser',
-    'neotest-dart',
-  })
-
-  package.preload['neotest.async'] = function()
-    return {
-      fn = {
-        tempname = function()
-          return '/tmp/neotest-dart-results'
-        end,
-      },
-    }
-  end
-  package.preload['plenary.path'] = function()
-    return { path = { sep = '/' } }
-  end
-  package.preload['neotest.lib'] = function()
-    return {
-      files = {
-        match_root_pattern = function()
-          return function()
-            return '/tmp/project'
-          end
-        end,
-        read = function()
-          return ''
-        end,
-      },
-      treesitter = {
-        parse_positions = function()
-          return {
-            iter = function()
-              return function()
-                return nil
-              end
-            end,
-          }
-        end,
-      },
-    }
-  end
-  package.preload['neotest-dart.utils'] = function()
-    return {
-      get_test_name_from_outline = function()
-        return nil
-      end,
-      remove_surrounding_quates = function(name)
-        return name
-      end,
-      construct_test_name = function()
-        return 'works'
-      end,
-      position_target = function(position)
-        return string.format('%s?line=%s', position.path, position.range[1] + 1)
-      end,
-      join_path = function(...)
-        return table.concat({ ... }, '/')
-      end,
-    }
-  end
-  package.preload['neotest-dart.parser'] = function()
-    return {
-      parse_lines = function()
-        return {}
-      end,
-    }
-  end
-  package.preload['neotest-dart.lsp_outline_parser'] = function()
-    return {
-      parse = function()
-        return {}
-      end,
-    }
-  end
-
-  local original_create_autocmd = vim.api.nvim_create_autocmd
-  vim.api.nvim_create_autocmd = function() end
-
-  local ok, err = pcall(function()
-    local adapter = require('neotest-dart')
-    adapter({ command = 'dart', use_lsp = false })
-
-    local spec = adapter.build_spec({
-      tree = {
-        data = function()
-          return {
-            type = 'test',
-            id = '/tmp/project/test/foo_test.dart::"works"',
-            name = 'works',
-            path = '/tmp/project/test/foo_test.dart',
-            range = { 4, 2, 6, 7 },
-          }
-        end,
-      },
-    })
-
-    assert(
-      spec.command:match('^dart test "/tmp/project/test/foo_test%.dart%?line=5" '),
-      'Expected positional test target'
-    )
-    assert(not spec.command:match('%-%-plain%-name'), 'Did not expect plain-name argument')
-  end)
-
-  vim.api.nvim_create_autocmd = original_create_autocmd
-  if not ok then
-    error(err)
-  end
-end)
-
-test('adapter uses positional program for dart debug adapter', function()
+local function load_adapter(config)
   reset_modules({
     'neotest.async',
     'plenary.path',
@@ -570,16 +454,8 @@ test('adapter uses positional program for dart debug adapter', function()
     'neotest-dart',
     'dap',
   })
-
-  local registered_adapter
   package.preload['neotest.async'] = function()
-    return {
-      fn = {
-        tempname = function()
-          return '/tmp/neotest-dart-results'
-        end,
-      },
-    }
+    return { fn = { tempname = vim.fn.tempname } }
   end
   package.preload['plenary.path'] = function()
     return { path = { sep = '/' } }
@@ -588,241 +464,251 @@ test('adapter uses positional program for dart debug adapter', function()
     return {
       files = {
         match_root_pattern = function()
-          return function()
-            return '/tmp/project'
+          return function(path)
+            return path:match('^(.-)/test/') or path
           end
         end,
-        read = function()
-          return ''
-        end,
-      },
-      treesitter = {
-        parse_positions = function()
-          return {
-            iter = function()
-              return function()
-                return nil
-              end
-            end,
-          }
+        read = function(path)
+          return table.concat(vim.fn.readfile(path), '\n')
         end,
       },
     }
   end
-  package.preload['neotest-dart.utils'] = function()
-    return {
-      get_test_name_from_outline = function()
-        return nil
-      end,
-      remove_surrounding_quates = function(name)
-        return name
-      end,
-      construct_test_name = function()
-        return 'works'
-      end,
-      position_target = function(position)
-        return string.format('%s?line=%s', position.path, position.range[1] + 1)
-      end,
-      join_path = function(...)
-        return table.concat({ ... }, '/')
-      end,
-    }
-  end
-  package.preload['neotest-dart.parser'] = function()
-    return {
-      parse_lines = function()
-        return {}
-      end,
-    }
-  end
-  package.preload['neotest-dart.lsp_outline_parser'] = function()
-    return {
-      parse = function()
-        return {}
-      end,
-    }
-  end
+  local standalone = { type = 'executable', command = 'application-sdk' }
+  local dap = { adapters = { dart_test = standalone, dart = standalone } }
   package.preload['dap'] = function()
-    return {
-      adapters = setmetatable({}, {
-        __newindex = function(_, key, value)
-          if key == 'dart_test' then
-            registered_adapter = value
-          end
-        end,
-      }),
-    }
+    return dap
   end
+  local adapter = require('neotest-dart')(config or { command = 'dart', use_lsp = false })
+  return adapter, dap, standalone
+end
 
-  local original_create_autocmd = vim.api.nvim_create_autocmd
-  vim.api.nvim_create_autocmd = function() end
+local function scope(kind, path, name)
+  local position = {
+    type = kind,
+    path = path or '/tmp/project with spaces/test/foo_test.dart',
+    range = { 4, 2, 6, 7 },
+  }
+  position.id = position.path .. (name and ('::"outer [x]"::"' .. name .. '"') or '')
+  local tree = {}
+  function tree:data()
+    return position
+  end
+  function tree:iter_nodes()
+    local yielded = false
+    return function()
+      if not yielded then
+        yielded = true
+        return 1, tree
+      end
+    end
+  end
+  return tree
+end
 
-  local ok, err = pcall(function()
-    local adapter = require('neotest-dart')
-    adapter({ command = 'dart', use_lsp = false })
+test('argv is immutable and captures owner independently of editor cwd', function()
+  local configured = { '--define', 'message=spaces; $(touch nope)' }
+  local extra = { '--name', 'literal "quoted" name' }
+  local config_command = { '/tmp/sdk with spaces/dart' }
+  local adapter = load_adapter({
+    command = config_command,
+    additional_args = configured,
+    use_lsp = false,
+  })
+  local tree = scope('test', nil, 'works')
+  local first = adapter.build_spec({ tree = tree, extra_args = extra })
+  local second = adapter.build_spec({ tree = tree, extra_args = extra })
+  assert_eq(first.command, {
+    config_command[1],
+    'test',
+    tree:data().path .. '?line=5',
+    '--reporter',
+    'json',
+    '--name',
+    'literal "quoted" name',
+    '--define',
+    'message=spaces; $(touch nope)',
+  })
+  assert_eq(first.command, second.command)
+  assert_eq(first.cwd, '/tmp/project with spaces')
+  assert_eq(extra, { '--name', 'literal "quoted" name' })
+  assert_eq(configured, { '--define', 'message=spaces; $(touch nope)' })
+  first.command[1] = 'mutated'
+  assert_eq(config_command, { '/tmp/sdk with spaces/dart' })
+  assert_eq(adapter.build_spec({ tree = tree, extra_args = '--verbose' }).command[6], '--verbose')
+end)
 
+test('DAP owns only a private factory with immutable per-project SDK and file program', function()
+  local adapter, dap, standalone = load_adapter()
+  local first = adapter.build_spec({ tree = scope('test', nil, 'works (exact)'), strategy = 'dap' })
+  local factory = dap.adapters.neotest_dart
+  adapter({ command = '/other sdk/dart', use_lsp = false })
+  local second = adapter.build_spec({
+    tree = scope('test', '/tmp/other project/test/foo_test.dart', 'works (exact)'),
+    strategy = 'dap',
+  })
+  local resolved
+  factory(function(value)
+    resolved = value
+  end, first.strategy)
+  assert_eq(resolved.command, 'dart')
+  assert_eq(resolved.args, { 'debug_adapter', '--test' })
+  assert_eq(second.strategy._neotest_dart_adapter.command, '/other sdk/dart')
+  assert_eq(second.cwd, '/tmp/other project')
+  assert_eq(dap.adapters.dart_test, standalone)
+  assert_eq(dap.adapters.dart, standalone)
+  assert_eq(dap.adapters.neotest_dart, factory)
+  assert_eq(first.strategy.program, '/tmp/project with spaces/test/foo_test.dart')
+  assert_eq(first.strategy.toolArgs[2], '^outer \\[x\\] works \\(exact\\)$')
+  assert(first.strategy.toolArgs[3]:match('^%-%-file%-reporter=json:'))
+  dap.adapters.neotest_dart = standalone
+  assert(not pcall(adapter.build_spec, { tree = scope('file'), strategy = 'dap' }))
+  assert_eq(dap.adapters.neotest_dart, standalone)
+end)
+
+test(
+  'FVM resolves from each project and refuses a missing SDK rather than global fallback',
+  function()
+    local root = vim.fn.tempname() .. ' fvm project'
+    local bin = root .. '/.fvm/flutter_sdk/bin'
+    vim.fn.mkdir(bin, 'p')
+    local executable = bin .. '/dart'
+    vim.fn.writefile({ '#!/bin/sh', 'exit 0' }, executable)
+    vim.fn.setfperm(executable, 'rwx------')
+    local adapter = load_adapter({ command = 'fvm dart', use_lsp = false })
     local spec = adapter.build_spec({
-      tree = {
-        data = function()
-          return {
-            type = 'test',
-            id = '/tmp/project/test/foo_test.dart::"works"',
-            path = '/tmp/project/test/foo_test.dart',
-            range = { 1, 0, 1, 4 },
-          }
-        end,
-      },
+      tree = scope('file', root .. '/test/foo_test.dart'),
       strategy = 'dap',
     })
+    assert_eq(spec.strategy._neotest_dart_adapter.command, vim.loop.fs_realpath(executable))
+    assert_eq(spec.command[1], 'fvm')
+    assert_eq(spec.command[2], 'dart')
+    assert(not pcall(adapter.build_spec, {
+      tree = scope('file', root .. '/missing/test/foo_test.dart'),
+      strategy = 'dap',
+    }))
+    vim.fn.delete(root, 'rf')
+  end
+)
 
-    assert(
-      spec.command:match('^dart test /tmp/project/test/foo_test%.dart '),
-      'Expected dart test command'
+test('Flutter and nested directories retain their scope without claiming live support', function()
+  local adapter = load_adapter({ command = 'flutter', use_lsp = false })
+  local tree = scope('namespace', nil, 'nested')
+  local spec = adapter.build_spec({ tree = tree, strategy = 'dap' })
+  assert_eq(spec.strategy._neotest_dart_adapter.args, { 'debug-adapter', '--test' })
+  assert_eq(spec.strategy.program, tree:data().path)
+  assert_eq(spec.strategy.toolArgs[1], '--no-pub')
+  assert_eq(spec.strategy.toolArgs[3], '^outer \\[x\\] nested ')
+  local nested = adapter.build_spec({ tree = scope('dir', '/tmp/project/test/nested') })
+  assert_eq(nested.command[3], '/tmp/project/test/nested')
+end)
+
+test('final reports reject unreadable, empty, scalar, malformed and incomplete evidence', function()
+  local adapter = load_adapter()
+  local tree = scope('test', nil, 'works')
+  local function check(data)
+    local path = vim.fn.tempname()
+    if data then
+      vim.fn.writefile(data, path)
+    end
+    local results = adapter.results({ context = {} }, { output = path }, tree)
+    assert_eq(results[tree:data().id].status, 'failed')
+    assert(results[tree:data().id].errors[1].message)
+    vim.fn.delete(path)
+  end
+  check(nil)
+  check({})
+  check({ 'null' })
+  check({ 'true' })
+  check({ '{truncated' })
+  check({ vim.json.encode({ test = { id = 1, name = 'outer [x] works' } }) })
+  check({
+    vim.json.encode({ test = { id = 1, name = 'outer [x] works' } }),
+    vim.json.encode({ testID = 1, result = 'success' }),
+  })
+  check({ vim.json.encode({ type = 'done', success = true }) })
+  check({
+    vim.json.encode({ test = { id = 1, name = 'outer [x] works' } }),
+    vim.json.encode({ testID = 1, result = 'success', message = {} }),
+    vim.json.encode({ type = 'done', success = true }),
+  })
+end)
+
+test('final reports retain actual pass fail skip and decode escaped source URIs', function()
+  local adapter = load_adapter()
+  local tree = scope('test', nil, 'works')
+  for _, status in ipairs({ 'success', 'failure', 'skipped' }) do
+    local report = vim.fn.tempname()
+    vim.fn.writefile({
+      vim.json.encode({
+        test = {
+          id = 9,
+          name = 'dynamic name',
+          url = vim.uri_from_fname(tree:data().path),
+          line = 5,
+          column = 3,
+        },
+      }),
+      vim.json.encode({
+        testID = 9,
+        result = status == 'skipped' and 'success' or status,
+        skipped = status == 'skipped',
+        error = status == 'failure' and 'real failure' or nil,
+      }),
+      vim.json.encode({ type = 'done', success = status ~= 'failure' }),
+    }, report)
+    local results = adapter.results(
+      { context = { results_path = report } },
+      { output = '/not-the-report' },
+      tree
     )
-    assert(not spec.command:match('%-%-no%-pub'), 'Did not expect --no-pub for dart command')
-    assert_eq(spec.strategy.program, '/tmp/project/test/foo_test.dart?line=2')
-    assert_eq(spec.strategy.args, {})
-    assert_eq(registered_adapter.command, 'dart')
-    assert_eq(registered_adapter.args, { 'debug_adapter', '--test' })
-  end)
-
-  vim.api.nvim_create_autocmd = original_create_autocmd
-  if not ok then
-    error(err)
+    assert_eq(
+      results[tree:data().id].status,
+      ({ success = 'passed', failure = 'failed', skipped = 'skipped' })[status]
+    )
+    vim.fn.delete(report)
   end
 end)
 
-test('adapter uses positional program for flutter debug adapter', function()
-  reset_modules({
-    'neotest.async',
-    'plenary.path',
-    'neotest.lib',
-    'neotest-dart.utils',
-    'neotest-dart.parser',
-    'neotest-dart.lsp_outline_parser',
-    'neotest-dart',
-    'dap',
-  })
+test('unreadable group reports fail descendants instead of leaving apparent skips', function()
+  local adapter = load_adapter()
+  local root = scope('file')
+  local child = scope('test', nil, 'works')
+  root.iter_nodes = function()
+    return ipairs({ root, child })
+  end
+  local results = adapter.results({ context = {} }, { output = vim.fn.tempname() }, root)
+  assert_eq(results[root:data().id].status, 'failed')
+  assert_eq(results[child:data().id].status, 'failed')
+end)
 
-  local registered_adapter
-  package.preload['neotest.async'] = function()
-    return {
-      fn = {
-        tempname = function()
-          return '/tmp/neotest-dart-results'
-        end,
-      },
-    }
-  end
-  package.preload['plenary.path'] = function()
-    return { path = { sep = '/' } }
-  end
-  package.preload['neotest.lib'] = function()
-    return {
-      files = {
-        match_root_pattern = function()
-          return function()
-            return '/tmp/project'
-          end
-        end,
-        read = function()
-          return ''
-        end,
-      },
-      treesitter = {
-        parse_positions = function()
-          return {
-            iter = function()
-              return function()
-                return nil
-              end
-            end,
-          }
-        end,
-      },
-    }
-  end
-  package.preload['neotest-dart.utils'] = function()
-    return {
-      get_test_name_from_outline = function()
-        return nil
-      end,
-      remove_surrounding_quates = function(name)
-        return name
-      end,
-      construct_test_name = function()
-        return 'works'
-      end,
-      position_target = function(position)
-        return string.format('%s?line=%s', position.path, position.range[1] + 1)
-      end,
-      join_path = function(...)
-        return table.concat({ ... }, '/')
-      end,
-    }
-  end
-  package.preload['neotest-dart.parser'] = function()
-    return {
-      parse_lines = function()
-        return {}
-      end,
-    }
-  end
-  package.preload['neotest-dart.lsp_outline_parser'] = function()
-    return {
-      parse = function()
-        return {}
-      end,
-    }
-  end
-  package.preload['dap'] = function()
-    return {
-      adapters = setmetatable({}, {
-        __newindex = function(_, key, value)
-          if key == 'dart_test' then
-            registered_adapter = value
-          end
-        end,
-      }),
-    }
-  end
-
-  local original_create_autocmd = vim.api.nvim_create_autocmd
-  vim.api.nvim_create_autocmd = function() end
-
-  local ok, err = pcall(function()
-    local adapter = require('neotest-dart')
-    adapter({ command = 'flutter', use_lsp = false })
-
-    local spec = adapter.build_spec({
-      tree = {
-        data = function()
-          return {
-            type = 'test',
-            id = '/tmp/project/test/foo_test.dart::"works"',
-            path = '/tmp/project/test/foo_test.dart',
-            range = { 1, 0, 1, 4 },
-          }
-        end,
-      },
-      strategy = 'dap',
-    })
-
-    assert(
-      spec.command:match('^flutter test /tmp/project/test/foo_test%.dart '),
-      'Expected flutter test command'
+test('a skipped generated case does not hide a passing case at the same location', function()
+  load_adapter()
+  local tree = scope('test', nil, 'works')
+  local lines = {}
+  for id, skipped in ipairs({ false, true }) do
+    table.insert(
+      lines,
+      vim.json.encode({
+        test = {
+          id = id,
+          name = 'generated case ' .. id,
+          url = vim.uri_from_fname(tree:data().path),
+          line = 5,
+          column = 3,
+        },
+      })
     )
-    assert(spec.command:match('%-%-no%-pub'), 'Expected --no-pub for flutter command')
-    assert_eq(spec.strategy.program, '/tmp/project/test/foo_test.dart?line=2')
-    assert_eq(spec.strategy.args, { '--no-pub' })
-    assert_eq(registered_adapter.command, 'flutter')
-    assert_eq(registered_adapter.args, { 'debug-adapter', '--test' })
-  end)
-
-  vim.api.nvim_create_autocmd = original_create_autocmd
-  if not ok then
-    error(err)
+    table.insert(lines, vim.json.encode({ testID = id, result = 'success', skipped = skipped }))
   end
+  table.insert(lines, vim.json.encode({ type = 'done', success = true }))
+  local results = require('neotest-dart.parser').parse_lines(
+    tree,
+    lines,
+    {},
+    { final = true, write_output = false }
+  )
+  assert_eq(results[tree:data().id].status, 'passed')
 end)
 
 if #failures > 0 then

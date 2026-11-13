@@ -38,24 +38,30 @@ local function flatten(list)
   return result
 end
 
-local function uses_flutter(command_to_check)
-  return command_to_check:find('flutter', 1, true) ~= nil
-end
-
-local function uses_fvm(command_to_check)
-  return vim.startswith(command_to_check, 'fvm ')
-end
-
-local function resolve_dap_command()
-  local dap_command = uses_flutter(command) and 'flutter' or 'dart'
-
-  if uses_fvm(command) then
-    local dap_bin_symlink =
-      utils.join_path(vim.loop.cwd(), '.fvm', 'flutter_sdk', 'bin', dap_command)
-    return vim.loop.fs_realpath(dap_bin_symlink) or dap_command
+local function command_argv()
+  if type(command) == 'table' then
+    return vim.deepcopy(command)
   end
+  if command == 'fvm flutter' or command == 'fvm dart' then
+    return vim.split(command, ' ')
+  end
+  return { command }
+end
 
-  return dap_command
+local function uses_flutter(argv)
+  return vim.fn.fnamemodify(argv[#argv], ':t'):gsub('%.bat$', '') == 'flutter'
+end
+
+local function resolve_dap_command(argv, root)
+  local executable = uses_flutter(argv) and 'flutter' or 'dart'
+  if argv[1] == 'fvm' then
+    local suffix = vim.fn.has('win32') == 1 and (executable == 'flutter' and '.bat' or '.exe') or ''
+    local sdk = utils.join_path(root, '.fvm', 'flutter_sdk', 'bin', executable .. suffix)
+    assert(vim.fn.executable(sdk) == 1, 'Missing project FVM executable: ' .. sdk)
+    return vim.loop.fs_realpath(sdk) or sdk
+  end
+  assert(#argv == 1, 'DAP command must be an SDK executable or fvm dart/flutter')
+  return argv[1]
 end
 
 function adapter.is_test_file(file_path)
@@ -119,45 +125,50 @@ function adapter.discover_positions(path)
   return tree
 end
 
-local function construct_test_argument(position, strategy)
-  local test_argument = {}
-  if uses_flutter(command) then
-    table.insert(test_argument, '--no-pub')
-  end
-
-  return test_argument
+local dap_factory = function(callback, config)
+  callback(vim.deepcopy(config._neotest_dart_adapter))
 end
 
----@return table?
-local function get_strategy_config(strategy, path, script_args)
-  local config = {
-    dap = function()
-      local status_ok, dap = pcall(require, 'dap')
-      if not status_ok then
-        return
-      end
-      local dap_command = resolve_dap_command()
-      dap.adapters.dart_test = {
-        type = 'executable',
-        command = dap_command,
-        args = { uses_flutter(command) and 'debug-adapter' or 'debug_adapter', '--test' },
-        options = { -- Dartls is slow to start so avoid warnings from nvim-dap
-          initialize_timeout_sec = 30,
-        },
-      }
-      return {
-        type = 'dart_test',
-        name = 'Neotest Debugger',
-        request = 'launch',
-        program = path,
-        args = script_args,
-        evaluateToStringInDebugViews = true,
-      }
-    end,
-  }
-  if config[strategy] then
-    return config[strategy]()
+local function get_strategy_config(strategy, position, root, argv, extra_args, results_path)
+  if strategy ~= 'dap' then
+    return
   end
+  local dap = require('dap')
+  assert(
+    dap.adapters.neotest_dart == nil or dap.adapters.neotest_dart == dap_factory,
+    'DAP adapter neotest_dart is already owned by another integration'
+  )
+  dap.adapters.neotest_dart = dap_factory
+  local tool_args = vim.deepcopy(extra_args)
+  if uses_flutter(argv) then
+    table.insert(tool_args, '--no-pub')
+  end
+  -- The SDK adapter requires a source file as program, not a ?line URI.
+  -- --name is a regex; anchor and escape it to avoid selecting sibling tests.
+  if position.type == 'test' or position.type == 'namespace' then
+    local name = utils.construct_test_name(position, outline)
+    local pattern = '^' .. name:gsub('([\\.^$|?*+(){}%[%]])', '\\%1')
+    pattern = pattern .. (position.type == 'test' and '$' or ' ')
+    vim.list_extend(tool_args, { '--name', pattern })
+  end
+  table.insert(tool_args, '--file-reporter=json:' .. results_path)
+  return {
+    type = 'neotest_dart',
+    name = 'Neotest Debugger',
+    request = 'launch',
+    stopOnEntry = false,
+    program = position.path,
+    cwd = root,
+    args = {},
+    toolArgs = tool_args,
+    evaluateToStringInDebugViews = true,
+    _neotest_dart_adapter = {
+      type = 'executable',
+      command = resolve_dap_command(argv, root),
+      args = { uses_flutter(argv) and 'debug-adapter' or 'debug_adapter', '--test' },
+      options = { initialize_timeout_sec = 30 },
+    },
+  }
 end
 
 ---@async
@@ -170,74 +181,40 @@ function adapter.build_spec(args)
   if not tree then
     return {}
   end
-
   local position = tree:data()
-
-  local command_parts = {}
-
+  local root = assert(adapter.root(position.path), 'No pubspec.yaml owner for ' .. position.path)
+  local argv = command_argv()
+  local target = utils.position_target(position)
   if position.type == 'dir' then
-    if string.sub(position.path, -#'/test') == '/test' then
-      command_parts = {
-        command,
-        'test',
-        position.path,
-        '--reporter',
-        'json',
-      }
-    else
-      command_parts = {
-        command,
-        'test',
-        string.format('%s/%s', position.path, 'test'),
-        '--reporter',
-        'json',
-      }
-    end
+    target = position.path == root and utils.join_path(root, 'test') or position.path
   end
-
-  local test_argument = construct_test_argument(position, args.strategy)
-  local test_target = utils.position_target(position)
-
-  if position.type == 'test' or position.type == 'file' or position.type == 'namespace' then
-    command_parts = {
-      command,
-      'test',
-      args.strategy == 'dap' and position.path or string.format('"%s"', test_target),
-      test_argument,
-      '--reporter',
-      'json',
-    }
-  end
-
-  local extra_args = args.extra_args or {}
-  if type(extra_args) == 'string' then
-    extra_args = { extra_args }
-  else
-    for _, arg in ipairs(additional_args) do
-      table.insert(extra_args, arg)
-    end
+  local extra_args = {}
+  vim.list_extend(extra_args, flatten(args.extra_args or {}))
+  vim.list_extend(extra_args, flatten(additional_args))
+  local command_parts = vim.deepcopy(argv)
+  vim.list_extend(command_parts, { 'test', target, '--reporter', 'json' })
+  if uses_flutter(argv) then
+    table.insert(command_parts, '--no-pub')
   end
   vim.list_extend(command_parts, extra_args)
-
-  local strategy_target = args.strategy == 'dap' and test_target or position.path
-  local strategy_config = get_strategy_config(args.strategy, strategy_target, test_argument)
-  local full_command = table.concat(vim.iter(command_parts):flatten():totable(), ' ')
+  local strategy_config =
+    get_strategy_config(args.strategy, position, root, argv, extra_args, results_path)
 
   return {
-    command = full_command,
+    command = command_parts,
+    cwd = root,
     context = {
-      results_path = results_path,
+      results_path = args.strategy == 'dap' and results_path or nil,
       file = position.path,
+      root = root,
     },
     strategy = strategy_config,
     stream = function(data)
       return function()
-        local lines = data()
-        for _, line in ipairs(lines) do
+        for _, line in ipairs(data()) do
           table.insert(partial_output, line)
         end
-        local tests = parser.parse_lines(tree, partial_output, outline, { write_output = false })
-        return tests
+        return parser.parse_lines(tree, partial_output, outline, { write_output = false })
       end
     end,
   }
@@ -278,18 +255,21 @@ local function register_lsp_outline_handler()
 end
 
 ---@async
----@param _ neotest.RunSpec
+---@param spec neotest.RunSpec
 ---@param result neotest.StrategyResult
 ---@param tree neotest.Tree
----@return table<string, neotest.Result[]>
-function adapter.results(_, result, tree)
-  local success, data = pcall(lib.files.read, result.output)
-  if not success then
-    return {}
+---@return table<string, neotest.Result>
+function adapter.results(spec, result, tree)
+  local report = spec.context and spec.context.results_path or result.output
+  local success, data = pcall(lib.files.read, report)
+  if not success or type(data) ~= 'string' then
+    return parser.failed_result(
+      tree,
+      'Unable to read Dart test report: ' .. tostring(report),
+      result.output
+    )
   end
-  local lines = vim.split(data, '\n')
-  local tests = parser.parse_lines(tree, lines, outline)
-  return tests
+  return parser.parse_lines(tree, vim.split(data, '\n'), outline, { final = true })
 end
 
 setmetatable(adapter, {
