@@ -538,6 +538,51 @@ test('argv is immutable and captures owner independently of editor cwd', functio
   assert_eq(adapter.build_spec({ tree = tree, extra_args = '--verbose' }).command[6], '--verbose')
 end)
 
+test('command resolver runs once per owning root and snapshots alternating SDKs', function()
+  local dart_root, flutter_root = '/tmp/Dart project', '/tmp/Flutter project'
+  local dart_command = { '/tmp/Dart SDK/dart' }
+  local flutter_command = { '/tmp/Flutter SDK/flutter' }
+  local calls = {}
+  local adapter, dap, standalone = load_adapter({
+    command = function(root)
+      table.insert(calls, root)
+      assert(root == dart_root or root == flutter_root)
+      return root == dart_root and dart_command or flutter_command
+    end,
+    use_lsp = false,
+  })
+  local function build(root)
+    return adapter.build_spec({
+      tree = scope('test', root .. '/test/foo_test.dart', 'works (exact)'),
+      strategy = 'dap',
+    })
+  end
+  local first, second, third = build(dart_root), build(flutter_root), build(dart_root)
+  assert_eq(calls, { dart_root, flutter_root, dart_root })
+  assert_eq(first.cwd, dart_root)
+  assert_eq(second.cwd, flutter_root)
+  assert_eq(first.command[1], dart_command[1])
+  assert_eq(second.command[1], flutter_command[1])
+  assert_eq(third.command[1], dart_command[1])
+  assert_eq(dart_command, { '/tmp/Dart SDK/dart' })
+  assert_eq(flutter_command, { '/tmp/Flutter SDK/flutter' })
+  assert_eq(first.strategy._neotest_dart_adapter.args, { 'debug_adapter', '--test' })
+  assert_eq(second.strategy._neotest_dart_adapter.args, { 'debug-adapter', '--test' })
+  assert_eq(second.strategy.toolArgs[1], '--no-pub')
+  dart_command[1], flutter_command[1] = 'changed Dart SDK', 'changed Flutter SDK'
+  first.command[1] = 'changed invocation'
+  for _, pair in ipairs({ { first, '/tmp/Dart SDK/dart' }, { second, '/tmp/Flutter SDK/flutter' } }) do
+    local resolved
+    dap.adapters.neotest_dart(function(value)
+      resolved = value
+    end, pair[1].strategy)
+    assert_eq(resolved.command, pair[2])
+  end
+  assert_eq(third.command[1], '/tmp/Dart SDK/dart')
+  assert_eq(dap.adapters.dart, standalone)
+  assert_eq(dap.adapters.dart_test, standalone)
+end)
+
 test('DAP owns only a private factory with immutable per-project SDK and file program', function()
   local adapter, dap, standalone = load_adapter()
   local first = adapter.build_spec({ tree = scope('test', nil, 'works (exact)'), strategy = 'dap' })
