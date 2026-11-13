@@ -10,7 +10,7 @@ local adapter = { name = 'neotest-dart' }
 
 adapter.root = lib.files.match_root_pattern('pubspec.yaml')
 
---- Command to use for running tests. Value is set from config
+--- Command string/argv or resolver(pubspec_root) -> argv. Value is set from config.
 local command = 'flutter'
 local custom_test_method_names = {}
 local additional_args = {}
@@ -38,14 +38,18 @@ local function flatten(list)
   return result
 end
 
-local function command_argv()
-  if type(command) == 'table' then
-    return vim.deepcopy(command)
+local function command_argv(root)
+  local resolved = command
+  if type(resolved) == 'function' then
+    resolved = resolved(root)
   end
-  if command == 'fvm flutter' or command == 'fvm dart' then
-    return vim.split(command, ' ')
+  if type(resolved) == 'table' then
+    return vim.deepcopy(resolved)
   end
-  return { command }
+  if resolved == 'fvm flutter' or resolved == 'fvm dart' then
+    return vim.split(resolved, ' ')
+  end
+  return { resolved }
 end
 
 local function uses_flutter(argv)
@@ -183,7 +187,7 @@ function adapter.build_spec(args)
   end
   local position = tree:data()
   local root = assert(adapter.root(position.path), 'No pubspec.yaml owner for ' .. position.path)
-  local argv = command_argv()
+  local argv = command_argv(root)
   local target = utils.position_target(position)
   if position.type == 'dir' then
     target = position.path == root and utils.join_path(root, 'test') or position.path
